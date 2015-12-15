@@ -912,13 +912,17 @@ def reconfigure_net(vsphere_client, vm, module, esxi, resource_pool, guest, vm_n
             module.fail_json(msg="Cannot find datacenter named: %s" % datacenter)
         dcprops = VIProperty(vsphere_client, dcmor)
         nfmor = dcprops.networkFolder._obj
+        defined_nics = [k[len(k) -1] for k in vm_nic.keys()]
+        
         for k,v in vm_nic.iteritems():
             nicNum = k[len(k) -1]
+            hasDev = False
             if vm_nic[k]['network_type'] == 'dvs':
                 portgroupKey = find_portgroup_key(module, s, nfmor, vm_nic[k]['network'])
                 todvs = True
             elif vm_nic[k]['network_type'] == 'standard':
                 todvs = False
+            
             # Detect cards that need to be changed and network type (and act accordingly)
             for dev in vm.properties.config.hardware.device:
                 if dev._type in ["VirtualE1000", "VirtualE1000e",
@@ -926,6 +930,7 @@ def reconfigure_net(vsphere_client, vm, module, esxi, resource_pool, guest, vm_n
                                  "VirtualNmxnet2", "VirtualVmxnet3"]:
                     devNum = dev.deviceInfo.label[len(dev.deviceInfo.label) - 1]
                     if devNum == nicNum:
+                        hasDev = True # device already exists
                         fromdvs = dev.deviceInfo.summary.split(':')[0] == 'DVSwitch'
                         if todvs and fromdvs:
                             if dev.backing.port._obj.get_element_portgroupKey() != portgroupKey:
@@ -941,14 +946,23 @@ def reconfigure_net(vsphere_client, vm, module, esxi, resource_pool, guest, vm_n
                                 pass
                         else:
                             module.exit_json()
-
-        if len(nics) > 0:
+                    
+                    # Remove no  longer defined devices
+                    if devNum not in defined_nics:
+                        nics[dev.deviceInfo.label] = (dev, '', 4)
+                    
+            # Add new device if needed
+            if not hasDev:
+                add_nic(module, vsphere_client, nfmor, request.new_spec(), nic_changes, vm_nic[k]['type'], vm_nic[k]['network'], vm_nic[k]['network_type'])
+                
+        if len(nics) > 0 or len(nic_changes) > 0:
             for nic, obj in nics.iteritems():
                 """
-                1,2 and 3 are used to mark which action should be taken
+                1,2,3 and 4 are used to mark which action should be taken
                 1 = from a distributed switch to a distributed switch
                 2 = to a standard switch
                 3 = to a distributed switch
+                4 = remove interface
                 """
                 dev = obj[0]
                 pgKey = obj[1]
@@ -977,8 +991,10 @@ def reconfigure_net(vsphere_client, vm, module, esxi, resource_pool, guest, vm_n
                 spec = request.new_spec()
                 nic_change = spec.new_deviceChange()
                 nic_change.set_element_device(dev._obj)
-                nic_change.set_element_operation("edit")
+                nic_change.set_element_operation("remove" if obj[2] == 4 else "edit")
                 nic_changes.append(nic_change)
+            
+            spec = request.new_spec()            
             spec.set_element_deviceChange(nic_changes)
             request.set_element_spec(spec)
             ret = vsphere_client._proxy.ReconfigVM_Task(request)._returnval
